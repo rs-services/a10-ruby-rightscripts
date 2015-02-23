@@ -7,8 +7,12 @@ hostname = ENV['HOSTNAME']
 username = ENV['USERNAME']
 password = ENV['PASSWORD']
 
+lb_ip = ENV['LB_IP']
 server_ip = ENV['SERVER_IP']
-deployment_name = ENV['DEPLOYMENT_NAME']
+deployment_name = ENV['DEPLOYMENT_NAME'].split('-').last #.gsub(/[\-\s]/,"")
+puts "Cleaned deployment name #{deployment_name}"
+
+action = ENV['ACTION']
 
 health_monitor_xml_to_json = <<EOF
 {
@@ -128,7 +132,7 @@ EOF
 
 # Service Groups
 def service_group_delete(a10, name)
-  a10.send(:axapi, 'slb.service_group.delete', 'get', {name: name, format: 'json'})
+  a10.send(:axapi, 'slb.service_group.delete', 'post', {name: name, format: 'json'})
 end
 
 def service_group_getAll(a10)
@@ -141,7 +145,7 @@ end
 
 def service_group_create(a10, options={})
   options.merge!({format: 'json'})
-  a10.send(:axapi, 'slb.service_group.create', 'get', options)
+  a10.send(:axapi, 'slb.service_group.create', 'post', options)
 end
 
 def service_group_deleteAllMembers(a10, name)
@@ -150,7 +154,7 @@ end
 
 def service_group_update(a10, options={})
   options.merge!({format: 'json'})
-  a10.send(:axapi, 'slb.service_group.update', 'get', options)
+  a10.send(:axapi, 'slb.service_group.update', 'post', options)
 end
 
 # VIPs
@@ -160,16 +164,16 @@ end
 
 def vip_create(a10, options={})
   options.merge!({format: 'json'})
-  a10.send(:axapi, 'slb.virtual_server.create', 'get', options)
+  a10.send(:axapi, 'slb.virtual_server.create', 'post', options)
 end
 
-def vip_delete(a10, name, address)
-  a10.send(:axapi, 'slb.virtual_server.delete', 'get', {name: name, address: address, format: 'json'})
+def vip_delete(a10, name)
+  a10.send(:axapi, 'slb.virtual_server.delete', 'post', {name: name})
 end
 
 def vip_update(a10, options={})
   options.merge!({format: 'json'})
-  a10.send(:axapi, 'slb.virtual_server.update', 'get', options)
+  a10.send(:axapi, 'slb.virtual_server.update', 'post', options)
 end
 
 # Health Monitors
@@ -178,31 +182,179 @@ def hm_getAll(a10)
   a10.send(:axapi, 'slb.hm.getAll', 'get')
 end
 
+def hm_create(a10, options={})
+  a10.send(:axapi, 'slb.hm.create', 'post', options)
+end
+
+def hm_update(a10, options={})
+  a10.send(:axapi, 'slb.hm.update', 'post', options)
+end
+
+def hm_delete(a10, name)
+  a10.send(:axapi, 'slb.hm.delete', 'post', {name: name})
+end
+
+def create_hm(a10, name, backend_port)
+  hm_list = hm_getAll(a10)
+  puts JSON.pretty_generate(hm_list)
+  our_hm = hm_list['response']['health_monitor_list']['health_monitor'].select {|s| s['name'] == name}
+
+  hmhash =
+  {
+    name: name,
+    retry: "3",
+    consec_pass_reqd: "1",
+    interval: "5",
+    time_out: "5",
+    strictly_retry: "0",
+    disable_after_down: "0",
+    type: "http",
+    port: backend_port,
+    url: "GET /"
+  }
+
+  unless our_hm.size > 0
+    puts "Attempting to create Health Monitor"
+    puts JSON.pretty_generate(hmhash)
+    response = hm_create(a10, hmhash)
+    create_body = response.body
+    puts "Create HM response looks like #{create_body}"
+  else
+    puts "Attempting to update Health Monitor"
+    puts JSON.pretty_generate(hmhash)
+    response = hm_update(a10, hmhash)
+    update_body = response.body
+    puts "Update HM response looks like #{update_body}"
+  end
+end
+
+def create_sg(a10,name,backend_ip,backend_port)
+  sg_list = JSON.parse(service_group_getAll(a10).body)
+  puts JSON.pretty_generate(sg_list)
+  our_sg = sg_list['service_group_list'].select {|g| g['name'] == name}
+
+  member_for_request = {
+    server: backend_ip,
+    port: backend_port,
+    template: "default",
+    priority: 5,
+    status: 1,
+    stats_data: 1
+  }
+
+  request_hash = {
+    name: name,
+    protocol: 2,
+    lb_method: 0,
+    health_monitor: name,
+    min_active_member: {
+      status: 0,
+      number: 0,
+      priority_set: 0
+    },
+    backup_server_event_log_enable: 0,
+    client_reset: 0,
+    stats_data: 1,
+    extended_stats: 0
+  }
+
+  unless our_sg.size > 0
+    request_hash['member_list'] = [member_for_request]
+    puts "Attempting to create Service Group"
+    puts JSON.pretty_generate(request_hash)
+    response = service_group_create(a10, request_hash)
+    create_body = response.body
+    puts "Create SG response looks like #{create_body}"
+  else
+    request_hash = our_sg.first
+    request_hash['member_list'] << member_for_request
+    puts "Attempting to update Service Group"
+    puts JSON.pretty_generate(request_hash)
+    response = service_group_update(a10, request_hash)
+    update_body = response.body
+    puts "Update SG response looks like #{update_body}"
+  end
+end
+
+def create_vip(a10, name, frontend_ip, frontend_port)
+  vip_list = JSON.parse(vip_getAll(a10).body)
+  puts JSON.pretty_generate(vip_list)
+  our_vip = vip_list['virtual_server_list'].select {|s| s['name'] == name}
+
+  request_hash = {
+    name: name,
+    address: frontend_ip,
+    vport_list: [
+      {
+        protocol: 2,
+        port: frontend_port,
+        name: name,
+        service_group: name,
+        connection_limit: {
+          status: 0,
+          connection_limit: 8000000,
+          connection_limit_action: 0,
+          connection_limit_log: 0
+        },
+        default_selection: 1,
+        received_hop: 0,
+        status: 1,
+        stats_data: 1,
+        extended_stats: 0,
+        snat_against_vip: 0,
+        vport_template: "default",
+        vport_acl_id: 0,
+        send_reset: 0,
+        ha_connection_mirror: 0,
+        direct_server_return: 0,
+        sync_cookie: {
+          sync_cookie: 0,
+          sack: 0
+        },
+        source_nat: "SNAT",
+        source_nat_auto: 1,
+        source_nat_precedence: 0,
+      }
+    ]
+  }
+
+  unless our_vip.size > 0
+    puts "Attempting to create VIP"
+    puts JSON.pretty_generate(request_hash)
+    response = vip_create(a10, request_hash)
+    create_body = response.body
+    puts "Create VIP response looks like #{create_body}"
+  else
+    puts "Attempting to update VIP"
+    puts JSON.pretty_generate(request_hash)
+    response = vip_update(a10, request_hash)
+    update_body = response.body
+    puts "Update VIP response looks like #{update_body}"
+  end
+end
+
+def create_lb(a10,name,frontend_ip,frontend_port,backend_ip,backend_port)
+  create_hm(a10,name,backend_port)
+  create_sg(a10,name,backend_ip,backend_port)
+  create_vip(a10,name,frontend_ip,frontend_port)
+end
+
+def destroy_lb(a10,name)
+  vip_delete(a10,name)
+  service_group_delete(a10,name)
+  hm_delete(a10,name)
+end
+
 a10 = Warthog::A10::AXDevice.new(hostname,username,password)
 
 a10.class.ssl_version :TLSv1
 a10.class.default_options.update(verify: false)
 
-sg_list = JSON.parse(service_group_getAll(a10).body)
-puts JSON.pretty_generate(sg_list)
-our_sg = sg_list['service_group_list'].select {|g| g['name'] == deployment_name}
-#our_sg = sg_list.xpath("//service_group[name='#{deployment_name}']")
-unless our_sg.size > 0
-  response = service_group_create(a10, {protocol: 2, name: deployment_name})
-  create_body = response.body
-  puts "Create SG response looks like #{create_body}"
+case action
+when 'create'
+  create_lb(a10, deployment_name, lb_ip, 80, server_ip, 8080)
+when 'delete'
+  destroy_lb(a10,deployment_name)
+else
+  puts "Dunno what to do for action #{action}"
 end
-
-vip_list = JSON.parse(vip_getAll(a10).body)
-puts JSON.pretty_generate(vip_list)
-our_vip = vip_list['virtual_server_list'].select {|s| s['name'] == deployment_name}
-#our_vip = vip_list.xpath("//virtual_server[name='#{deployment_name}']")
-unless our_vip.size > 0
-  response = vip_create(a10, {name: deployment_name, address: '10.0.0.129', status: 1, service_group: deployment_name})
-  create_body = response.body
-  puts "Create VIP response looks like #{create_body}"
-end
-
-hm_list = hm_getAll(a10)
-puts JSON.pretty_generate(hm_list)
-our_hm = hm_list['health_monitor_list'].select {|s| s['name'] == deployment_name}
